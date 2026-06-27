@@ -1,142 +1,116 @@
 /**
  * @file src/hooks/useGPS.ts
- * @description React hook for real-time GPS location tracking via the Geolocation API.
+ * @description React hook for native GPS location tracking via Capacitor Geolocation.
  *
- * Provides continuous location monitoring using `watchPosition` for real-time
- * updates during monitoring. GPS coordinates are stored in the Zustand store
- * and formatted into Google Maps links for emergency alerts.
- *
- * Falls back to a hardcoded demo location (Chennai, India) if:
- * - The browser does not support the Geolocation API
- * - The user denies location permission
- * - Location acquisition times out
+ * Replaces Navigator Geolocation with the Capacitor Geolocation plugin.
+ * Keeps the identical startTracking/stopTracking interface contract.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { Geolocation } from '@capacitor/geolocation';
 import { useAgentStore } from '../store/agentStore';
 import {
   DEMO_GPS_LATITUDE,
   DEMO_GPS_LONGITUDE,
-  GPS_HIGH_ACCURACY,
-  GPS_TIMEOUT_MS,
 } from '../config/constants';
 import { createModuleLogger } from '../utils/logger';
 
 const log = createModuleLogger('GPS');
 
 /**
- * Manages real-time GPS tracking for ResQ location-based emergency dispatch.
- *
- * @returns Object containing:
- * - `gpsPermission` — null (not requested), true (granted), false (denied)
- * - `startTracking` — Begins GPS watch and immediate position fix
- * - `stopTracking` — Clears the GPS watch subscription
- *
- * @example
- * ```tsx
- * const { gpsPermission, startTracking, stopTracking } = useGPS();
- * useEffect(() => { startTracking(); return stopTracking; }, []);
- * ```
+ * Manages native GPS tracking for ResQ location-based emergency dispatch.
  */
 export const useGPS = () => {
   const { setCoordinates, addLog } = useAgentStore();
   const [gpsPermission, setGpsPermission] = useState<boolean | null>(null);
-  /** Stores the watchPosition subscription ID for cleanup. */
-  const watchId = useRef<number | null>(null);
+  
+  /** Stores the watchPosition callback ID for cleanup. */
+  const watchId = useRef<string | null>(null);
 
   /**
-   * Begins GPS tracking with a `watchPosition` subscription.
-   *
-   * Also fires `getCurrentPosition` once immediately to get a fast initial fix,
-   * in case `watchPosition` takes time to stabilize.
-   *
-   * GPS options:
-   * - `enableHighAccuracy: true` — requests GNSS (hardware GPS) over cell tower
-   * - `timeout: 10000ms` — gives up if no fix within 10 seconds
-   * - `maximumAge: 0` — always returns fresh coordinates (never cached)
+   * Begins native GPS tracking.
    */
-  const startTracking = useCallback(() => {
-    if (typeof navigator === 'undefined' || !navigator.geolocation) {
-      addLog('WARNING', '🗺️ Geolocation API not supported. Using demo coordinates.');
-      log.warn('navigator.geolocation unavailable — using fallback location');
-      setGpsPermission(false);
-      setCoordinates({
-        latitude: DEMO_GPS_LATITUDE,
-        longitude: DEMO_GPS_LONGITUDE,
-        accuracy: 10,
-        timestamp: Date.now(),
-      });
-      return;
-    }
+  const startTracking = useCallback(async () => {
+    try {
+      const permission = await Geolocation.requestPermissions();
+      if (permission.coarseLocation !== 'granted' && permission.location !== 'granted') {
+        addLog('WARNING', '🗺️ Native GPS permission denied. Using fallback coordinates.');
+        setGpsPermission(false);
+        setCoordinates({
+          latitude: DEMO_GPS_LATITUDE,
+          longitude: DEMO_GPS_LONGITUDE,
+          accuracy: 50,
+          timestamp: Date.now(),
+        });
+        return;
+      }
 
-    // Clear any existing watch before starting a new one
-    if (watchId.current !== null) {
-      navigator.geolocation.clearWatch(watchId.current);
-    }
-
-    addLog('INFO', '🗺️ Initializing GPS real-time tracking...');
-
-    const geoOptions: PositionOptions = {
-      enableHighAccuracy: GPS_HIGH_ACCURACY,
-      timeout: GPS_TIMEOUT_MS,
-      maximumAge: 0,
-    };
-
-    const onSuccess = (position: GeolocationPosition) => {
       setGpsPermission(true);
+      addLog('INFO', '🗺️ Initializing native GPS tracking...');
+
+      // Immediate position fix
+      const position = await Geolocation.getCurrentPosition({
+        enableHighAccuracy: true,
+        timeout: 10000,
+      });
+
       setCoordinates({
         latitude: position.coords.latitude,
         longitude: position.coords.longitude,
         accuracy: position.coords.accuracy,
         timestamp: position.timestamp,
       });
-    };
 
-    const onError = (error: GeolocationPositionError) => {
-      const errorMessages: Record<number, string> = {
-        1: 'Permission denied by user',
-        2: 'Position unavailable (no GPS signal)',
-        3: 'Timeout — location fix took too long',
-      };
-      const message = errorMessages[error.code] ?? error.message;
-      addLog('WARNING', `🗺️ GPS error: ${message}. Using demo coordinates.`);
-      log.warn(`Geolocation error (code ${error.code}): ${message}`);
-
-      if (error.code === GeolocationPositionError.PERMISSION_DENIED) {
-        setGpsPermission(false);
-      }
-
+      // Continuous native watch
+      watchId.current = await Geolocation.watchPosition(
+        {
+          enableHighAccuracy: true,
+          timeout: 10000,
+        },
+        (pos, err) => {
+          if (err) {
+            log.warn('Native geolocation watch error:', err);
+            return;
+          }
+          if (pos) {
+            setCoordinates({
+              latitude: pos.coords.latitude,
+              longitude: pos.coords.longitude,
+              accuracy: pos.coords.accuracy,
+              timestamp: pos.timestamp,
+            });
+          }
+        }
+      );
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      addLog('WARNING', `🗺️ GPS initialization failed: ${errMsg}. Using fallback.`);
+      log.error('startTracking failed', error);
       setCoordinates({
         latitude: DEMO_GPS_LATITUDE,
         longitude: DEMO_GPS_LONGITUDE,
         accuracy: 50,
         timestamp: Date.now(),
       });
-    };
-
-    // Immediate single fix
-    navigator.geolocation.getCurrentPosition(onSuccess, onError, geoOptions);
-
-    // Continuous watch
-    watchId.current = navigator.geolocation.watchPosition(onSuccess, onError, geoOptions);
+    }
   }, [setCoordinates, addLog]);
 
   /**
-   * Clears the GPS watchPosition subscription and logs the stop event.
+   * Stops Geolocation watch.
    */
-  const stopTracking = useCallback(() => {
+  const stopTracking = useCallback(async () => {
     if (watchId.current !== null) {
-      navigator.geolocation.clearWatch(watchId.current);
+      await Geolocation.clearWatch({ id: watchId.current });
       watchId.current = null;
-      addLog('INFO', '🗺️ GPS tracking stopped.');
+      addLog('INFO', '🗺️ Native GPS tracking stopped.');
     }
   }, [addLog]);
 
-  /** Cleanup on component unmount. */
+  /** Cleanup on unmount. */
   useEffect(() => {
     return () => {
       if (watchId.current !== null) {
-        navigator.geolocation.clearWatch(watchId.current);
+        void Geolocation.clearWatch({ id: watchId.current });
       }
     };
   }, []);
@@ -147,3 +121,4 @@ export const useGPS = () => {
     stopTracking,
   };
 };
+export default useGPS;

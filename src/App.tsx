@@ -12,7 +12,7 @@
  * - Overlays: AlertCountdown, Camera simulation overlay, SMS preview modal
  */
 
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useAgentStore } from './store/agentStore';
 import { useAccelerometer } from './hooks/useAccelerometer';
 import { useCamera } from './hooks/useCamera';
@@ -25,6 +25,7 @@ import { AlertCountdown } from './components/AlertCountdown';
 import { EmergencyContactForm } from './components/EmergencyContactForm';
 import { IncidentTimeline } from './components/IncidentTimeline';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { PermissionSetup } from './components/PermissionSetup';
 
 /**
  * Root application component.
@@ -42,6 +43,10 @@ import { ErrorBoundary } from './components/ErrorBoundary';
  * ```
  */
 export const App: React.FC = () => {
+  const [permissionsConfigured, setPermissionsConfigured] = useState(
+    localStorage.getItem('resq_permissions_configured') === 'true'
+  );
+
   const {
     setAgentState,
     addLog,
@@ -112,6 +117,10 @@ export const App: React.FC = () => {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  if (!permissionsConfigured) {
+    return <PermissionSetup onComplete={() => setPermissionsConfigured(true)} />;
+  }
 
   return (
     <div className="app-container">

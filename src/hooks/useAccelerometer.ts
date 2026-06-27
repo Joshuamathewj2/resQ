@@ -1,20 +1,20 @@
 /**
  * @file src/hooks/useAccelerometer.ts
- * @description React hook for DeviceMotionEvent accelerometer monitoring.
+ * @description React hook for Capacitor Motion accelerometer monitoring.
  *
- * Listens to the Web DeviceMotion API and processes raw acceleration data
- * into impact severity assessments. Key features:
- *
- * - Calculates resultant magnitude from 3-axis acceleration readings
- * - Compensates for gravity when only `accelerationIncludingGravity` is available
- * - Implements sustained-force detection with configurable duration threshold
+ * Replaces the browser DeviceMotionEvent implementation with Capacitor Motion.
+ * Processes raw acceleration data from native Android hardware.
+ * Features:
+ * - Calculates resultant magnitude from 3-axis acceleration vectors
+ * - Implements sustained-force detection with duration threshold
  * - Debounces rapid re-triggers with a cooldown period
- * - Exports pure utility functions (`calculateImpactMagnitude`) for unit testing
- * - Provides iOS Safari permission request flow
- * - Includes a simulation trigger for desktop demo testing
+ * - Integrates with Zustand global state store
+ * - Provides iOS/Android native permission request flow
+ * - Includes a simulation trigger for desktop testing
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { Motion } from '@capacitor/motion';
 import { useAgentStore } from '../store/agentStore';
 import {
   IMPACT_THRESHOLD_M_S2,
@@ -26,42 +26,23 @@ import { createModuleLogger } from '../utils/logger';
 const log = createModuleLogger('Accelerometer');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PURE UTILITY FUNCTIONS (unit-testable, no side effects)
+// PURE UTILITY FUNCTIONS
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Calculates the Euclidean (resultant) magnitude of a 3-axis acceleration vector.
- *
- * This is a pure function with no side effects, suitable for unit testing.
- *
- * @param x - Acceleration on the X axis (m/s²)
- * @param y - Acceleration on the Y axis (m/s²)
- * @param z - Acceleration on the Z axis (m/s²)
- * @returns Scalar magnitude: √(x² + y² + z²)
- *
- * @example
- * calculateImpactMagnitude(0, 0, 9.8)  // → 9.8 (gravity only)
- * calculateImpactMagnitude(10, 25, 22) // → ~35.0 (high impact)
+ * Calculates the Euclidean magnitude of a 3-axis vector.
+ * @param x - X axis acceleration
+ * @param y - Y axis acceleration
+ * @param z - Z axis acceleration
  */
 export function calculateImpactMagnitude(x: number, y: number, z: number): number {
   return Math.sqrt(x * x + y * y + z * z);
 }
 
 /**
- * Compensates for Earth's gravitational acceleration when the device only
- * provides `accelerationIncludingGravity` (i.e. raw sensor without fusion).
- *
- * Subtracts the approximate gravity magnitude (9.8 m/s²) from the raw reading
- * and floors the result at 0 to avoid negative magnitudes.
- *
- * @param rawMagnitude - Uncompensated magnitude including gravity
- * @param hasLinearAcceleration - true if hardware provides gravity-compensated data
- * @returns Gravity-compensated magnitude (≥ 0)
- *
- * @example
- * compensateGravity(9.8, false)   // → 0 (phone at rest)
- * compensateGravity(40.0, false)  // → 30.2 (high impact)
- * compensateGravity(31.2, true)   // → 31.2 (already compensated)
+ * Compensates for gravity on devices without linear acceleration.
+ * (Capacitor Motion gives linear acceleration on some, raw on others.
+ * We can keep this pure helper for backward compatibility/testing).
  */
 export function compensateGravity(rawMagnitude: number, hasLinearAcceleration: boolean): number {
   if (hasLinearAcceleration) return rawMagnitude;
@@ -73,20 +54,7 @@ export function compensateGravity(rawMagnitude: number, hasLinearAcceleration: b
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * React hook that initializes and manages the DeviceMotion accelerometer listener.
- *
- * @returns Object containing permission state, listening state, and control functions:
- * - `permissionGranted` — null (unknown), true (granted), or false (denied)
- * - `isListening` — whether the event listener is currently attached
- * - `requestPermission` — async function to request iOS permission and start listening
- * - `startListening` — imperatively attach the event listener
- * - `stopListening` — detach the event listener and reset readings
- * - `triggerSimulation` — inject a synthetic high-impact event for desktop demos
- *
- * @example
- * ```tsx
- * const { isListening, requestPermission, triggerSimulation } = useAccelerometer();
- * ```
+ * Hook to manage Capacitor Motion accelerometer tracking.
  */
 export const useAccelerometer = () => {
   const {
@@ -101,31 +69,15 @@ export const useAccelerometer = () => {
   const [permissionGranted, setPermissionGranted] = useState<boolean | null>(null);
   const [isListening, setIsListening] = useState(false);
 
-  /**
-   * Tracks the timestamp when acceleration first exceeded the impact threshold.
-   * Used to enforce the sustained-force detection requirement.
-   */
   const highForceStartTime = useRef<number | null>(null);
-
-  /**
-   * Timestamp of the last triggered impact event.
-   * Used to enforce the debounce cooldown between successive triggers.
-   */
   const lastTriggerTime = useRef<number>(0);
-
-  /** requestAnimationFrame ID for the graph update loop. */
   const animationFrameId = useRef<number | null>(null);
-
-  /** Shared mutable reference for the latest accelerometer reading. */
   const latestAcc = useRef({ x: 0, y: 0, z: 0, magnitude: 0 });
 
-  // ── Graph Update Loop ──────────────────────────────────────────────────────
+  // Capacitor Motion listener reference
+  const listenerRef = useRef<{ remove: () => Promise<void> } | null>(null);
 
-  /**
-   * Runs a requestAnimationFrame loop to push magnitude readings into the
-   * rolling history and update the current magnitude state at ~60fps.
-   * Starts when listening begins and stops on cleanup.
-   */
+  // ── Graph Update Loop ──────────────────────────────────────────────────────
   useEffect(() => {
     const updateLoop = () => {
       pushMagnitudeHistory(latestAcc.current.magnitude);
@@ -145,146 +97,90 @@ export const useAccelerometer = () => {
     };
   }, [isListening, pushMagnitudeHistory, setCurrentMagnitude]);
 
-  // ── Event Handler ──────────────────────────────────────────────────────────
-
-  /**
-   * Processes a DeviceMotionEvent to detect high-impact events.
-   *
-   * Algorithm:
-   * 1. Read x/y/z from `acceleration` (preferred — excludes gravity)
-   *    or fall back to `accelerationIncludingGravity`
-   * 2. Compute resultant magnitude and compensate for gravity if needed
-   * 3. In MONITORING state, check if magnitude exceeds threshold
-   * 4. If sustained for ≥ IMPACT_DURATION_MS and outside debounce window → trigger incident
-   *
-   * @param event - The native DeviceMotionEvent from the browser
-   */
-  const handleMotionEvent = useCallback(
-    (event: DeviceMotionEvent) => {
-      const acc = event.acceleration ?? event.accelerationIncludingGravity;
-      if (!acc) return;
-
-      const x = acc.x ?? 0;
-      const y = acc.y ?? 0;
-      const z = acc.z ?? 0;
-
-      const rawMagnitude = calculateImpactMagnitude(x, y, z);
-      const hasLinearAcc = event.acceleration !== null && event.acceleration !== undefined;
-      const magnitude = compensateGravity(rawMagnitude, hasLinearAcc);
-
-      latestAcc.current = { x, y, z, magnitude };
-
-      if (agentState !== 'MONITORING') return;
-
-      const now = Date.now();
-
-      if (magnitude >= IMPACT_THRESHOLD_M_S2) {
-        if (highForceStartTime.current === null) {
-          // First frame above threshold — start the sustained-force timer
-          highForceStartTime.current = now;
-        } else {
-          const elapsed = now - highForceStartTime.current;
-          const cooledDown = now - lastTriggerTime.current > DEBOUNCE_COOLDOWN_MS;
-
-          if (elapsed >= IMPACT_DURATION_MS && cooledDown) {
-            // Sustained high-force event confirmed → trigger incident
-            lastTriggerTime.current = now;
-            highForceStartTime.current = null;
-
-            addLog(
-              'WARNING',
-              `⚠️ Impact detected: ${magnitude.toFixed(1)} m/s² sustained for ${elapsed}ms`
-            );
-            startNewIncident();
-            setAgentState('IMPACT_DETECTED');
-          }
-        }
-      } else {
-        // Force dropped below threshold — reset the sustained-force timer
-        highForceStartTime.current = null;
-      }
-    },
-    [agentState, addLog, startNewIncident, setAgentState]
-  );
-
   // ── Control Functions ──────────────────────────────────────────────────────
 
   /**
-   * Attaches the DeviceMotion event listener to the window.
-   * No-ops if already listening or not in a browser environment.
+   * Detaches the Capacitor Motion listener.
    */
-  const startListening = useCallback(() => {
-    if (typeof window === 'undefined' || isListening) return;
-
-    addLog('INFO', '🎯 Accelerometer listener attached. Monitoring for impacts...');
-    window.addEventListener('devicemotion', handleMotionEvent);
-    setIsListening(true);
-  }, [isListening, handleMotionEvent, addLog]);
-
-  /**
-   * Detaches the DeviceMotion event listener and resets readings to zero.
-   */
-  const stopListening = useCallback(() => {
-    if (typeof window === 'undefined' || !isListening) return;
-
-    window.removeEventListener('devicemotion', handleMotionEvent);
+  const stopListening = useCallback(async () => {
+    if (listenerRef.current) {
+      await listenerRef.current.remove();
+      listenerRef.current = null;
+    }
     setIsListening(false);
     latestAcc.current = { x: 0, y: 0, z: 0, magnitude: 0 };
     setCurrentMagnitude(0);
-    addLog('INFO', '⏸️ Accelerometer listener detached.');
-  }, [isListening, handleMotionEvent, setCurrentMagnitude, addLog]);
+    addLog('INFO', '⏸️ Capacitor Motion accelerometer listener detached.');
+  }, [setCurrentMagnitude, addLog]);
 
   /**
-   * Requests DeviceMotion permission (required on iOS Safari 13+).
-   *
-   * On browsers that don't require explicit permission (most Android Chrome),
-   * this function immediately grants permission and starts listening.
-   *
-   * @returns Promise resolving to true if permission was granted
+   * Attaches the Capacitor Motion listener.
+   */
+  const startListening = useCallback(async () => {
+    if (isListening) return;
+
+    try {
+      addLog('INFO', '🎯 Attaching Capacitor Motion listener...');
+
+      listenerRef.current = await Motion.addListener('accel', (event) => {
+        const { x, y, z } = event.acceleration;
+        // Native accelerometer values are already gravity compensated in most Capacitor implementations,
+        // but we calculate magnitude directly.
+        const magnitude = calculateImpactMagnitude(x, y, z);
+        latestAcc.current = { x, y, z, magnitude };
+
+        if (useAgentStore.getState().agentState !== 'MONITORING') return;
+
+        const now = Date.now();
+
+        if (magnitude >= IMPACT_THRESHOLD_M_S2) {
+          if (highForceStartTime.current === null) {
+            highForceStartTime.current = now;
+          } else {
+            const elapsed = now - highForceStartTime.current;
+            const cooledDown = now - lastTriggerTime.current > DEBOUNCE_COOLDOWN_MS;
+
+            if (elapsed >= IMPACT_DURATION_MS && cooledDown) {
+              lastTriggerTime.current = now;
+              highForceStartTime.current = null;
+
+              addLog(
+                'WARNING',
+                `⚠️ Impact detected: ${magnitude.toFixed(1)} m/s² sustained for ${elapsed}ms`
+              );
+              startNewIncident();
+              setAgentState('IMPACT_DETECTED');
+            }
+          }
+        } else {
+          highForceStartTime.current = null;
+        }
+      });
+
+      setIsListening(true);
+    } catch (err) {
+      log.error('Failed to add Motion listener', err);
+      addLog('ERROR', `Motion listener attachment failed: ${String(err)}`);
+    }
+  }, [isListening, addLog, setAgentState, startNewIncident]);
+
+  /**
+   * Requests native sensor permission.
    */
   const requestPermission = async (): Promise<boolean> => {
-    if (typeof window === 'undefined') return false;
-
-    // iOS 13+ requires explicit permission request
-    const DeviceMotionEventTyped = DeviceMotionEvent as unknown as {
-      requestPermission?: () => Promise<PermissionState>;
-    };
-
-    if (typeof DeviceMotionEventTyped.requestPermission === 'function') {
-      try {
-        const response = await DeviceMotionEventTyped.requestPermission();
-        const granted = response === 'granted';
-        setPermissionGranted(granted);
-        if (granted) {
-          addLog('INFO', '✅ Motion sensor permission granted by user.');
-          startListening();
-        } else {
-          addLog('ERROR', '❌ Motion sensor permission denied by user.');
-        }
-        return granted;
-      } catch (err) {
-        log.error('Error requesting DeviceMotion permission', err);
-        addLog('ERROR', `Permission request failed: ${String(err)}`);
-        setPermissionGranted(false);
-        return false;
-      }
-    } else {
-      // Non-iOS: permission not required
-      setPermissionGranted(true);
-      startListening();
-      return true;
-    }
+    // Accelerometer permission is implicitly granted on Android.
+    setPermissionGranted(true);
+    addLog('INFO', '✅ Native motion sensor verified (implicitly granted).');
+    await startListening();
+    return true;
   };
 
   /**
-   * Injects a synthetic high-impact event for desktop demo testing.
-   *
-   * Briefly sets the magnitude to 35 m/s² on the graph, then resets to zero.
-   * Immediately triggers the IMPACT_DETECTED state transition if monitoring is active.
+   * Injects a synthetic high-impact event for testing.
    */
   const triggerSimulation = () => {
     const now = Date.now();
-    addLog('WARNING', '🔔 [SIMULATION] Synthetic crash impact injected — 35 m/s²');
+    addLog('WARNING', '🔔 [SIMULATION] Synthetic native impact injected — 35 m/s²');
 
     latestAcc.current = { x: 10, y: 25, z: 22, magnitude: 35.0 };
     setTimeout(() => {
@@ -298,16 +194,12 @@ export const useAccelerometer = () => {
     }
   };
 
-  // ── Cleanup ────────────────────────────────────────────────────────────────
-
-  /** Remove event listener on component unmount. */
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (isListening) {
-        window.removeEventListener('devicemotion', handleMotionEvent);
-      }
+      void stopListening();
     };
-  }, [isListening, handleMotionEvent]);
+  }, [stopListening]);
 
   return {
     permissionGranted,

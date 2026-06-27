@@ -1,21 +1,16 @@
 /**
  * @file src/services/notificationService.ts
- * @description Emergency alert dispatch service for ResQ.
+ * @description Emergency alert dispatch service for ResQ (native + web).
  *
- * Implements a two-tier notification strategy:
- *
- * **Tier 1 — Twilio SMS API**: If `VITE_TWILIO_*` environment variables are
- * configured, sends direct SMS to all emergency contacts via the Twilio REST API.
- * Each contact's phone number receives an individually dispatched message.
- *
- * **Tier 2 — Browser Fallback**: If Twilio is not configured or all Twilio
- * calls fail, falls back to native browser protocols:
- * - `mailto:` — opens the device email client with a pre-composed alert
- * - `tel:` — opens the phone dialer to the primary emergency contact
- *
- * @see {@link https://www.twilio.com/docs/sms/api} for Twilio API documentation
+ * Implements a hybrid notification strategy:
+ * - On native platforms (Android/iOS): Uses Capacitor Haptics, Local Notifications,
+ *   deep-linked SMS, and native system emergency dialer.
+ * - On web platforms: Uses Twilio SMS API with browser mailto/tel fallbacks.
  */
 
+import { Capacitor } from '@capacitor/core';
+import { LocalNotifications } from '@capacitor/local-notifications';
+import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { EmergencyContact, GPSCoordinates, UserProfile } from '../types';
 import { getGoogleMapsLink } from './locationService';
 import { createModuleLogger } from '../utils/logger';
@@ -23,48 +18,106 @@ import { createModuleLogger } from '../utils/logger';
 const log = createModuleLogger('NotificationService');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TYPES
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Input data required to compose and send emergency alerts. */
-interface AlertData {
-  /** List of emergency contacts to notify */
-  contacts: EmergencyContact[];
-  /** User medical profile for inclusion in the alert message */
-  userProfile: UserProfile;
-  /** GPS coordinates at time of incident */
-  coordinates: GPSCoordinates;
-  /** AI-determined emergency severity score (0–10) */
-  emergencyScore: number;
-  /** AI reasoning text explaining the score */
-  reasoning: string;
-  /** One-sentence incident summary for the SMS body */
-  incidentSummary: string;
-}
-
-/** Return value from the alert dispatch operation. */
-interface AlertResult {
-  /** Whether at least one alert was successfully dispatched */
-  success: boolean;
-  /** Which notification pathway was used */
-  method: 'twilio' | 'fallback';
-  /** Human-readable log lines describing each dispatch attempt */
-  logs: string[];
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPERS
+// CAPACITOR NATIVE emergency helper functions
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Validates that all required Twilio environment variables are set to real values
- * (not placeholder strings from the .env.example file).
- *
- * @param accountSid - Twilio Account SID
- * @param authToken - Twilio Auth Token
- * @param fromNumber - Twilio source phone number
- * @returns true if all three values are present and non-placeholder
+ * Triggers native haptic vibration, then opens the system dialer with the number prefilled.
  */
+export async function triggerEmergencyDialer(emergencyNumber: string): Promise<void> {
+  try {
+    await Haptics.impact({ style: ImpactStyle.Heavy });
+    const dialUrl = `tel:${emergencyNumber}`;
+    window.open(dialUrl, '_system');
+    log.info(`Native emergency dialer opened for: ${emergencyNumber}`);
+  } catch (err) {
+    log.error('Failed to trigger native emergency dialer', err);
+  }
+}
+
+/**
+ * Compiles and sends a native SMS deep link to the recipient.
+ */
+export async function sendEmergencySMS(
+  contactNumber: string,
+  contactName: string,
+  location: { lat: number; lng: number; googleMapsLink: string },
+  incidentSummary: string,
+  confidenceScore: number
+): Promise<void> {
+  const message = encodeURIComponent(
+    `🚨 EMERGENCY ALERT — ResQ\n` +
+    `${contactName} may have been in a road accident.\n\n` +
+    `📍 Location: ${location.googleMapsLink}\n` +
+    `🤖 AI Confidence: ${confidenceScore.toFixed(1)}/10\n` +
+    `🕐 Time: ${new Date().toLocaleTimeString()}\n\n` +
+    `Incident: ${incidentSummary}\n` +
+    `Please check on them immediately.`
+  );
+
+  const smsUrl = `sms:${contactNumber}?body=${message}`;
+  window.open(smsUrl, '_system');
+  log.info(`Native SMS deep link triggered for: ${contactNumber}`);
+}
+
+/**
+ * Schedules and displays a native system notification.
+ */
+export async function showEmergencyNotification(title: string, body: string): Promise<void> {
+  try {
+    await LocalNotifications.requestPermissions();
+    await LocalNotifications.schedule({
+      notifications: [
+        {
+          id: Date.now(),
+          title,
+          body,
+          sound: 'beep.wav',
+          actionTypeId: 'EMERGENCY',
+          extra: { type: 'emergency' },
+        },
+      ],
+    });
+    log.info('Native local notification scheduled.');
+  } catch (err) {
+    log.error('Failed to trigger native local notification', err);
+  }
+}
+
+/**
+ * Vibrates the device in a repeating pattern.
+ */
+export async function triggerHapticAlert(): Promise<void> {
+  try {
+    for (let i = 0; i < 3; i++) {
+      await Haptics.impact({ style: ImpactStyle.Heavy });
+      await new Promise(r => setTimeout(r, 300));
+    }
+    log.info('Native haptic alert triggered.');
+  } catch (err) {
+    log.error('Failed to trigger native haptic alert', err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WEB PLATFORM TWILIO SMS IMPLEMENTATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface AlertData {
+  contacts: EmergencyContact[];
+  userProfile: UserProfile;
+  coordinates: GPSCoordinates;
+  emergencyScore: number;
+  reasoning: string;
+  incidentSummary: string;
+}
+
+interface AlertResult {
+  success: boolean;
+  method: 'twilio' | 'fallback';
+  logs: string[];
+}
+
 function hasTwilioCredentials(
   accountSid: string | undefined,
   authToken: string | undefined,
@@ -80,13 +133,6 @@ function hasTwilioCredentials(
   );
 }
 
-/**
- * Composes the emergency SMS body text from incident data.
- * Keeps the message concise and informative for first responders.
- *
- * @param data - Alert data containing user profile, location, and AI summary
- * @returns Formatted SMS body string
- */
 function composeSmsText(data: AlertData): string {
   const mapsLink = getGoogleMapsLink(data.coordinates);
   const timeString = new Date().toLocaleTimeString();
@@ -105,41 +151,56 @@ function composeSmsText(data: AlertData): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MAIN DISPATCH FUNCTION
+// UNIFIED ALERT DISPATCH (React store entrypoint)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Sends emergency alerts to all configured contacts via the best available method.
- *
- * Attempts Twilio SMS first. If Twilio credentials are missing or all SMS calls
- * fail, automatically falls back to mailto + tel browser protocols.
- *
- * @param data - Alert payload containing contacts, location, and AI analysis
- * @returns Promise resolving to AlertResult with dispatch outcome details
- *
- * @example
- * ```ts
- * const result = await sendEmergencyAlerts({
- *   contacts, userProfile, coordinates, emergencyScore: 8.5,
- *   reasoning: 'Rider unconscious...', incidentSummary: 'High severity crash detected'
- * });
- * result.logs.forEach(line => addLog('INFO', line));
- * ```
+ * Sends emergency alerts using either native Capacitor features or Web Twilio client.
  */
 export const sendEmergencyAlerts = async (data: AlertData): Promise<AlertResult> => {
   if (!data.contacts || data.contacts.length === 0) {
-    log.warn('sendEmergencyAlerts called with no contacts — aborting dispatch');
+    log.warn('sendEmergencyAlerts called with no contacts');
     return { success: false, method: 'fallback', logs: ['⚠️ No emergency contacts configured.'] };
   }
 
+  const alertLogs: string[] = [];
+
+  // ── Native Mobile Platform Flow ───────────────────────────────────────────
+  if (Capacitor.isNativePlatform()) {
+    alertLogs.push('📱 Running on native platform. Dispatching native emergency actions...');
+    
+    await triggerHapticAlert();
+    await showEmergencyNotification(
+      '🚨 Emergency Detected',
+      'ResQ has detected a possible accident. Opening emergency services.'
+    );
+
+    const primaryContact = data.contacts[0]!;
+    const lat = data.coordinates.latitude ?? 12.9716;
+    const lng = data.coordinates.longitude ?? 80.2209;
+    const mapsLink = getGoogleMapsLink(data.coordinates);
+
+    alertLogs.push(`💬 Launching native SMS messenger to: ${primaryContact.name}`);
+    await sendEmergencySMS(
+      primaryContact.phone,
+      data.userProfile.name,
+      { lat, lng, googleMapsLink: mapsLink },
+      data.incidentSummary,
+      data.emergencyScore
+    );
+
+    alertLogs.push(`📞 Launching native emergency dialer to: ${primaryContact.name}`);
+    await triggerEmergencyDialer(primaryContact.phone);
+
+    return { success: true, method: 'fallback', logs: alertLogs };
+  }
+
+  // ── Web Twilio Platform Flow ──────────────────────────────────────────────
   const accountSid = import.meta.env.VITE_TWILIO_ACCOUNT_SID as string | undefined;
   const authToken = import.meta.env.VITE_TWILIO_AUTH_TOKEN as string | undefined;
   const fromNumber = import.meta.env.VITE_TWILIO_PHONE_NUMBER as string | undefined;
 
   const smsText = composeSmsText(data);
-  const alertLogs: string[] = [];
-
-  // ── Tier 1: Twilio SMS ────────────────────────────────────────────────────
 
   if (hasTwilioCredentials(accountSid, authToken, fromNumber)) {
     alertLogs.push('📡 Twilio credentials detected. Attempting SMS dispatch...');
@@ -187,29 +248,20 @@ export const sendEmergencyAlerts = async (data: AlertData): Promise<AlertResult>
     log.info('Twilio credentials absent — using browser fallback');
   }
 
-  // ── Tier 2: Browser Fallback ──────────────────────────────────────────────
-
-  alertLogs.push('📲 Executing native browser alert protocols...');
-
-  // Mailto trigger
+  // Mailto fallback
   const emails = data.contacts.map(c => c.email).filter(Boolean).join(',');
   if (emails) {
-    const mailSubject = encodeURIComponent(
-      `🚨 ResQ Emergency Alert: ${data.userProfile.name || 'User'}`
-    );
+    const mailSubject = encodeURIComponent(`🚨 ResQ Emergency Alert: ${data.userProfile.name || 'User'}`);
     const mailBody = encodeURIComponent(smsText);
-    const mailtoUrl = `mailto:${emails}?subject=${mailSubject}&body=${mailBody}`;
-    window.open(mailtoUrl, '_blank');
-    alertLogs.push('📬 Mailto protocol triggered — email client should open.');
+    window.open(`mailto:${emails}?subject=${mailSubject}&body=${mailBody}`, '_blank');
+    alertLogs.push('📬 Mailto protocol triggered.');
   }
 
-  // Tel dialer for primary contact
+  // Tel dialer fallback
   const primaryContact = data.contacts[0];
   if (primaryContact?.phone) {
     window.location.href = `tel:${primaryContact.phone}`;
-    alertLogs.push(`📞 Phone dialer triggered for ${primaryContact.name} (${primaryContact.phone}).`);
-  } else {
-    alertLogs.push('⚠️ No phone number available for primary contact.');
+    alertLogs.push(`📞 Phone dialer triggered for ${primaryContact.name}.`);
   }
 
   return { success: true, method: 'fallback', logs: alertLogs };
