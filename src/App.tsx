@@ -1,3 +1,17 @@
+/**
+ * @file src/App.tsx
+ * @description Root application component for ResQ.
+ *
+ * Composes all top-level hooks, wires them together, and renders the
+ * application layout. The component tree is wrapped in an ErrorBoundary
+ * to prevent full UI crashes during active monitoring sessions.
+ *
+ * Layout:
+ * - Header: brand logo, title, tagline
+ * - Main: Dashboard + MonitoringStatus + IncidentTimeline + Settings
+ * - Overlays: AlertCountdown, Camera simulation overlay, SMS preview modal
+ */
+
 import React, { useEffect } from 'react';
 import { useAgentStore } from './store/agentStore';
 import { useAccelerometer } from './hooks/useAccelerometer';
@@ -10,72 +24,101 @@ import { MonitoringStatus } from './components/MonitoringStatus';
 import { AlertCountdown } from './components/AlertCountdown';
 import { EmergencyContactForm } from './components/EmergencyContactForm';
 import { IncidentTimeline } from './components/IncidentTimeline';
+import { ErrorBoundary } from './components/ErrorBoundary';
 
+/**
+ * Root application component.
+ *
+ * Initialises all hooks and renders the full ResQ interface.
+ * Wrapped in ErrorBoundary at the call site in main.tsx to catch
+ * any unhandled rendering errors without crashing the monitoring session.
+ *
+ * @example
+ * ```tsx
+ * // In main.tsx:
+ * <ErrorBoundary>
+ *   <App />
+ * </ErrorBoundary>
+ * ```
+ */
 export const App: React.FC = () => {
-  const { 
-    setAgentState, 
-    addLog, 
-    isCameraActiveSimulated, 
-    showSmsSimulated, 
-    smsMessageSimulated, 
-    setShowSmsSimulated 
+  const {
+    setAgentState,
+    addLog,
+    isCameraActiveSimulated,
+    showSmsSimulated,
+    smsMessageSimulated,
+    setShowSmsSimulated,
   } = useAgentStore();
-  
-  // Initialize device hooks
+
+  // ── Device Hooks ────────────────────────────────────────────────────────
   const { startCamera, stopCamera, captureFrame } = useCamera();
   const { startTracking, stopTracking } = useGPS();
-  const { 
-    isListening, 
-    requestPermission, 
-    stopListening 
-  } = useAccelerometer();
+  const { isListening, requestPermission, stopListening } = useAccelerometer();
 
-  // Initialize simulation controller hook
+  // ── Control Hooks ────────────────────────────────────────────────────────
   const { runDemoSimulation, cancelSimulation, resetAgent } = useSimulation();
 
-  // Orchestrate the main agent control loops
+  // Orchestrate agent control loops (countdown, analysis, post-incident)
   const { cancelAlert } = useAgentLoop(startCamera, stopCamera, captureFrame);
 
-  // Monitor toggle trigger functions
+  // ── Monitoring Control Handlers ──────────────────────────────────────────
+
+  /**
+   * Starts the monitoring session. Requests accelerometer permission first,
+   * then initialises GPS tracking and transitions to MONITORING state.
+   */
   const handleStartMonitoring = async () => {
-    const motionPerm = await requestPermission();
-    
-    if (motionPerm) {
-      startTracking(); // Start location monitoring
+    const motionPermGranted = await requestPermission();
+    if (motionPermGranted) {
+      startTracking();
       setAgentState('MONITORING');
-      addLog('INFO', '🚀 ResQ system monitoring successfully initialized.');
+      addLog('INFO', '🚀 ResQ monitoring session initialised. Watching for high-impact events...');
     } else {
-      alert('ResQ requires motion sensors to detect impacts.');
+      alert('ResQ requires motion sensor access to detect impacts. Please grant permission and try again.');
     }
   };
 
+  /**
+   * Stops monitoring and returns the agent to IDLE state.
+   * Detaches all event listeners and clears GPS tracking.
+   */
   const handleStopMonitoring = () => {
     stopListening();
     stopTracking();
     setAgentState('IDLE');
-    addLog('INFO', '⏸️ ResQ system paused.');
+    addLog('INFO', '⏸️ ResQ monitoring session paused. Agent returned to IDLE.');
   };
 
-  // Consolidate cancel action for both simulator & accelerometer
+  /**
+   * Unified cancel handler that aborts both live alerts and demo simulation alerts.
+   * Called by the AlertCountdown cancel button.
+   */
   const handleCancelAll = () => {
     cancelAlert();
     cancelSimulation();
   };
 
-  // Clean up hooks on unmount
+  // ── Cleanup on Unmount ───────────────────────────────────────────────────
+
+  /**
+   * Ensures sensor listeners and GPS watches are cleaned up when the component
+   * unmounts (e.g., navigating away or hot-reloading in development).
+   */
   useEffect(() => {
     return () => {
       stopListening();
       stopTracking();
     };
-  }, [stopListening, stopTracking]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="app-container">
-      {/* Navigation Brand Header */}
+      {/* ── Brand Header ──────────────────────────────────────────────────── */}
       <header className="app-header">
         <div className="brand-section">
-          <span className="brand-logo">🚨</span>
+          <span className="brand-logo" aria-hidden="true">🚨</span>
           <div>
             <h1 className="brand-title">ResQ</h1>
             <p className="brand-tagline">AI Autonomous Emergency Agent</p>
@@ -83,57 +126,111 @@ export const App: React.FC = () => {
         </div>
       </header>
 
-      {/* Main Grid Panels */}
+      {/* ── Main Content Grid ──────────────────────────────────────────────── */}
       <main>
-        {/* Telemetry Dashboard Console */}
+        {/* Telemetry Dashboard with sensor graph and controls */}
         <Dashboard
-          onStart={handleStartMonitoring}
+          onStart={() => void handleStartMonitoring()}
           onStop={handleStopMonitoring}
           onSimulate={runDemoSimulation}
           onReset={resetAgent}
           isListening={isListening}
         />
 
-        {/* AI Agent Status Observation Log Panel */}
-        <MonitoringStatus />
+        {/* AI Agent Status Panel — hidden in IDLE */}
+        <ErrorBoundary>
+          <MonitoringStatus />
+        </ErrorBoundary>
 
-        {/* Console Incident Timelines and Archive Logs */}
-        <IncidentTimeline />
+        {/* Incident log timeline + IndexedDB archive */}
+        <ErrorBoundary>
+          <IncidentTimeline />
+        </ErrorBoundary>
 
-        {/* Medical configuration & contact records */}
+        {/* User medical profile + emergency contacts settings */}
         <EmergencyContactForm />
       </main>
 
-      {/* Red Alert Countdown Modal Overlay */}
+      {/* ── Overlays ──────────────────────────────────────────────────────── */}
+
+      {/* Emergency alert countdown modal */}
       <AlertCountdown onCancel={handleCancelAll} />
 
-      {/* Simulated Camera Feed Acquisition Overlay */}
+      {/* Camera acquisition simulation overlay */}
       {isCameraActiveSimulated && (
-        <div className="alert-overlay" style={{ background: 'rgba(0, 0, 0, 0.9)', zIndex: 10000 }}>
-          <div className="alert-box" style={{ borderColor: '#38bdf8', boxShadow: '0 0 50px rgba(56, 189, 248, 0.4)' }}>
-            <div className="brand-logo" style={{ fontSize: '3rem', marginBottom: '16px' }}>📷</div>
-            <h2 className="alert-title" style={{ color: '#38bdf8' }}>Camera Activated</h2>
-            <p className="alert-subtitle" style={{ fontSize: '1.1rem', marginTop: '8px' }}>Capturing scene for AI analysis...</p>
+        <div
+          id="camera-simulation-overlay"
+          className="alert-overlay"
+          style={{ background: 'rgba(0, 0, 0, 0.9)', zIndex: 10000 }}
+        >
+          <div
+            className="alert-box"
+            style={{ borderColor: '#38bdf8', boxShadow: '0 0 50px rgba(56, 189, 248, 0.4)' }}
+          >
+            <div className="brand-logo" style={{ fontSize: '3rem', marginBottom: '16px' }}>
+              📷
+            </div>
+            <h2 className="alert-title" style={{ color: '#38bdf8' }}>
+              Camera Activated
+            </h2>
+            <p className="alert-subtitle" style={{ fontSize: '1.1rem', marginTop: '8px' }}>
+              Capturing post-impact scene for AI analysis...
+            </p>
           </div>
         </div>
       )}
 
-      {/* Simulated SMS Alert Delivery Acknowledgment Modal */}
+      {/* Simulated SMS dispatch preview modal */}
       {showSmsSimulated && (
-        <div className="alert-overlay" style={{ background: 'rgba(0, 0, 0, 0.85)', zIndex: 9999 }}>
-          <div className="alert-box" style={{ borderColor: '#10b981', boxShadow: '0 0 50px rgba(16, 185, 129, 0.4)', maxWidth: '520px' }}>
-            <div className="brand-logo" style={{ fontSize: '3rem', marginBottom: '16px' }}>💬</div>
-            <h2 className="alert-title" style={{ color: '#10b981' }}>Simulated SMS Transmission</h2>
-            <p className="section-subtitle" style={{ marginBottom: '16px' }}>The following autonomous dispatch alert has been sent to emergency contacts:</p>
-            <div className="summary-text-block" style={{ textAlign: 'left', background: '#0a0a0f', border: '1px solid #1e1e24', fontFamily: 'monospace', fontSize: '0.85rem', whiteSpace: 'pre-wrap', lineHeight: '1.5' }}>
+        <div
+          id="sms-simulation-overlay"
+          className="alert-overlay"
+          style={{ background: 'rgba(0, 0, 0, 0.85)', zIndex: 9999 }}
+        >
+          <div
+            className="alert-box"
+            style={{
+              borderColor: '#10b981',
+              boxShadow: '0 0 50px rgba(16, 185, 129, 0.4)',
+              maxWidth: '520px',
+            }}
+          >
+            <div className="brand-logo" style={{ fontSize: '3rem', marginBottom: '16px' }}>
+              💬
+            </div>
+            <h2 className="alert-title" style={{ color: '#10b981' }}>
+              Emergency Alert Dispatched
+            </h2>
+            <p className="section-subtitle" style={{ marginBottom: '16px' }}>
+              The following autonomous emergency SMS has been sent to your contacts:
+            </p>
+            <div
+              className="summary-text-block"
+              style={{
+                textAlign: 'left',
+                background: '#0a0a0f',
+                border: '1px solid #1e1e24',
+                fontFamily: 'monospace',
+                fontSize: '0.85rem',
+                whiteSpace: 'pre-wrap',
+                lineHeight: '1.5',
+              }}
+            >
               {smsMessageSimulated}
             </div>
-            <button 
-              onClick={() => setShowSmsSimulated(false)} 
-              className="btn btn-primary mt-4" 
-              style={{ width: '100%', background: '#10b981', color: '#fff', fontSize: '1rem', padding: '12px' }}
+            <button
+              id="btn-acknowledge-sms"
+              onClick={() => setShowSmsSimulated(false)}
+              className="btn btn-primary mt-4"
+              style={{
+                width: '100%',
+                background: '#10b981',
+                color: '#fff',
+                fontSize: '1rem',
+                padding: '12px',
+              }}
             >
-              Acknowledge Alert
+              Acknowledge & Continue Monitoring
             </button>
           </div>
         </div>

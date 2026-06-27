@@ -1,156 +1,313 @@
-import { create } from 'zustand';
-import { AgentState, EmergencyContact, UserProfile, GPSCoordinates, IncidentLog, GeminiResponse } from '../types';
-import { CONFIG } from '../config/constants';
+/**
+ * @file src/store/agentStore.ts
+ * @description Zustand state store for ResQ global application state.
+ *
+ * This store is the single source of truth for:
+ * - Agent state machine current state
+ * - Live sensor readings and history
+ * - GPS coordinates
+ * - Emergency contacts and user profile
+ * - Incident logs and analysis results
+ * - App mode (Active vs Silent)
+ * - Multi-modal confidence scores
+ * - Simulation-specific UI state
+ *
+ * State is persisted to localStorage for contacts, profile, and app mode.
+ * Incident logs are persisted to IndexedDB via the incidentLogger service.
+ */
 
+import { create } from 'zustand';
+import {
+  AgentState,
+  AppMode,
+  EmergencyContact,
+  UserProfile,
+  GPSCoordinates,
+  IncidentLog,
+  GeminiResponse,
+  ConfidenceScore,
+} from '../types';
+import {
+  COUNTDOWN_DURATION_SEC,
+  STORAGE_KEY_CONTACTS,
+  STORAGE_KEY_USER_PROFILE,
+  STORAGE_KEY_APP_MODE,
+  ACCELEROMETER_HISTORY_SIZE,
+} from '../config/constants';
+import { createModuleLogger } from '../utils/logger';
+
+const log = createModuleLogger('AgentStore');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STORE INTERFACE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Complete shape of the Zustand agent store — state fields + action methods. */
 interface AgentStore {
+  // ── State Fields ────────────────────────────────────────────────────────────
+
+  /** Current state machine position */
   agentState: AgentState;
+  /** App operational mode: ACTIVE (full UI) or SILENT (auto-proceed) */
+  appMode: AppMode;
+  /** Latest GPS fix */
   coordinates: GPSCoordinates;
+  /** Most recent accelerometer resultant magnitude (m/s²) */
   currentMagnitude: number;
+  /** Rolling history of magnitudes for the telemetry graph */
   accelerometerHistory: number[];
+  /** Chronological incident timeline (newest first in UI) */
   logs: IncidentLog[];
+  /** Configured emergency contacts */
   contacts: EmergencyContact[];
+  /** User medical profile */
   userProfile: UserProfile;
+  /** Seconds remaining on the cancellation countdown */
   countdownSeconds: number;
+  /** Active incident ID (null when no incident is in progress) */
   currentIncidentId: string | null;
+  /** Most recent Gemini Vision analysis result */
   activeAnalysisResult: GeminiResponse | null;
-  
-  // Simulation specific states
+  /** Multi-modal fused confidence score for the current incident */
+  confidenceScore: ConfidenceScore | null;
+
+  // ── Simulation UI State ─────────────────────────────────────────────────────
+  /** Whether the simulated camera capture overlay is shown */
   isCameraActiveSimulated: boolean;
+  /** Whether the simulated SMS preview overlay is shown */
   showSmsSimulated: boolean;
+  /** Content of the simulated SMS message for display */
   smsMessageSimulated: string;
+  /** Ordered feed of post-incident status updates */
   postIncidentFeed: string[];
-  
-  // Actions
+
+  // ── Actions ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Transitions the agent to a new state.
+   * Logs the transition to the incident timeline.
+   * No-ops if the state is already the requested value.
+   */
   setAgentState: (state: AgentState) => void;
+
+  /** Sets the app operational mode and persists to localStorage. */
+  setAppMode: (mode: AppMode) => void;
+
+  /** Updates the GPS coordinates in state. */
   setCoordinates: (coords: GPSCoordinates) => void;
+
+  /** Updates the current accelerometer reading. */
   setCurrentMagnitude: (mag: number) => void;
+
+  /**
+   * Pushes a new magnitude reading into the rolling graph history.
+   * Drops the oldest value to maintain ACCELEROMETER_HISTORY_SIZE length.
+   */
   pushMagnitudeHistory: (mag: number) => void;
+
+  /**
+   * Appends a new log entry to the incident timeline.
+   * Entries are prepended (newest first) for UI display.
+   */
   addLog: (type: IncidentLog['type'], message: string, details?: string, image?: string) => void;
+
+  /** Clears all log entries from state (does not affect IndexedDB). */
   clearLogs: () => void;
+
+  /** Updates the emergency contacts list and persists to localStorage. */
   setContacts: (contacts: EmergencyContact[]) => void;
+
+  /** Updates the user medical profile and persists to localStorage. */
   setUserProfile: (profile: UserProfile) => void;
+
+  /** Updates the countdown timer value. */
   setCountdownSeconds: (seconds: number) => void;
+
+  /**
+   * Starts a new incident record.
+   * Generates a unique incident ID, resets per-incident state, and logs the trigger.
+   * @returns The newly generated incident ID
+   */
   startNewIncident: () => string;
+
+  /** Concludes the current incident and resets incident-specific state. */
   endIncident: () => void;
+
+  /** Stores the latest Gemini Vision analysis result. */
   setActiveAnalysisResult: (result: GeminiResponse | null) => void;
-  
-  // Simulation actions
+
+  /** Stores the latest fused confidence score. */
+  setConfidenceScore: (score: ConfidenceScore | null) => void;
+
+  // Simulation-specific actions
+  /** Shows/hides the camera capture simulation overlay. */
   setCameraActiveSimulated: (active: boolean) => void;
+  /** Shows/hides the SMS preview simulation overlay. */
   setShowSmsSimulated: (show: boolean) => void;
+  /** Sets the simulated SMS message content. */
   setSmsMessageSimulated: (msg: string) => void;
+  /** Prepends a post-incident status update to the feed. */
   addPostIncidentFeed: (feedItem: string) => void;
+  /** Clears the post-incident monitoring feed. */
   clearPostIncidentFeed: () => void;
 }
 
-const getLocalStorage = <T>(key: string, defaultValue: T): T => {
+// ─────────────────────────────────────────────────────────────────────────────
+// PERSISTENCE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Safely reads and JSON-parses a value from localStorage.
+ * Returns the defaultValue if the key is missing or parsing fails.
+ *
+ * @param key - The localStorage key to read
+ * @param defaultValue - Fallback value if key is absent or malformed
+ * @returns Parsed value or defaultValue
+ */
+function getLocalStorage<T>(key: string, defaultValue: T): T {
   try {
     const item = localStorage.getItem(key);
-    return item ? JSON.parse(item) : defaultValue;
+    return item ? (JSON.parse(item) as T) : defaultValue;
   } catch (e) {
+    log.warn(`Failed to parse localStorage key "${key}". Using default.`, e);
     return defaultValue;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DEFAULT DATA
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Demo emergency contact pre-populated for hackathon judging convenience. */
+const DEFAULT_CONTACTS: EmergencyContact[] = [
+  { id: '1', name: 'Peter', phone: '+919940335499', email: 'peter@spider.web', relation: 'Friend' },
+];
+
+/** Demo user profile pre-populated for hackathon judging convenience. */
+const DEFAULT_USER_PROFILE: UserProfile = {
+  name: 'Tony Stark',
+  bloodType: 'A+',
+  medicalConditions: 'Healthy',
+  allergies: 'None',
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// STORE DEFINITION
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The global Zustand store instance.
+ * Access state reactively in React components with `useAgentStore(selector)`.
+ * Access state imperatively outside React with `useAgentStore.getState()`.
+ */
 export const useAgentStore = create<AgentStore>((set, get) => ({
+  // ── Initial State ──────────────────────────────────────────────────────────
   agentState: 'IDLE',
+  appMode: getLocalStorage<AppMode>(STORAGE_KEY_APP_MODE, 'ACTIVE'),
   coordinates: { latitude: null, longitude: null, accuracy: null, timestamp: null },
   currentMagnitude: 0,
-  accelerometerHistory: Array(50).fill(0),
+  accelerometerHistory: Array<number>(ACCELEROMETER_HISTORY_SIZE).fill(0),
   logs: [],
-  contacts: getLocalStorage<EmergencyContact[]>(CONFIG.STORAGE_KEYS.CONTACTS, [
-    // Pre-populate Peter for demo purposes if list is empty
-    { id: '1', name: 'Peter', phone: '+919940335499', email: 'peter@spider.web', relation: 'Friend' }
-  ]),
-  userProfile: getLocalStorage<UserProfile>(CONFIG.STORAGE_KEYS.USER_PROFILE, {
-    name: 'Tony Stark',
-    bloodType: 'A+',
-    medicalConditions: 'Healthy',
-    allergies: 'No'
-  }),
-  countdownSeconds: CONFIG.COUNTDOWN_DURATION_SEC,
+  contacts: getLocalStorage<EmergencyContact[]>(STORAGE_KEY_CONTACTS, DEFAULT_CONTACTS),
+  userProfile: getLocalStorage<UserProfile>(STORAGE_KEY_USER_PROFILE, DEFAULT_USER_PROFILE),
+  countdownSeconds: COUNTDOWN_DURATION_SEC,
   currentIncidentId: null,
   activeAnalysisResult: null,
-  
-  // Simulation default values
+  confidenceScore: null,
+
+  // Simulation state
   isCameraActiveSimulated: false,
   showSmsSimulated: false,
   smsMessageSimulated: '',
   postIncidentFeed: [],
 
-  setAgentState: (agentState) => {
+  // ── Actions ────────────────────────────────────────────────────────────────
+
+  setAgentState: (agentState: AgentState) => {
     const oldState = get().agentState;
-    if (oldState !== agentState) {
-      set({ agentState });
-      get().addLog('INFO', `Agent state transitioned: ${oldState} ➔ ${agentState}`);
-    }
+    if (oldState === agentState) return;
+    set({ agentState });
+    get().addLog('INFO', `🔄 State transition: ${oldState} ➔ ${agentState}`);
   },
-  
-  setCoordinates: (coordinates) => set({ coordinates }),
-  
-  setCurrentMagnitude: (currentMagnitude) => set({ currentMagnitude }),
-  
-  pushMagnitudeHistory: (mag) => set((state) => {
-    const history = [...state.accelerometerHistory.slice(1), mag];
-    return { accelerometerHistory: history };
-  }),
-  
+
+  setAppMode: (appMode: AppMode) => {
+    localStorage.setItem(STORAGE_KEY_APP_MODE, JSON.stringify(appMode));
+    set({ appMode });
+  },
+
+  setCoordinates: (coordinates: GPSCoordinates) => set({ coordinates }),
+
+  setCurrentMagnitude: (currentMagnitude: number) => set({ currentMagnitude }),
+
+  pushMagnitudeHistory: (mag: number) =>
+    set(state => ({
+      accelerometerHistory: [...state.accelerometerHistory.slice(1), mag],
+    })),
+
   addLog: (type, message, details, image) => {
     const newLog: IncidentLog = {
-      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
       timestamp: new Date().toISOString(),
       type,
       message,
       details,
-      image
+      image,
     };
-    set((state) => ({ logs: [newLog, ...state.logs] }));
+    set(state => ({ logs: [newLog, ...state.logs] }));
   },
-  
+
   clearLogs: () => set({ logs: [] }),
-  
-  setContacts: (contacts) => {
-    localStorage.setItem(CONFIG.STORAGE_KEYS.CONTACTS, JSON.stringify(contacts));
+
+  setContacts: (contacts: EmergencyContact[]) => {
+    localStorage.setItem(STORAGE_KEY_CONTACTS, JSON.stringify(contacts));
     set({ contacts });
   },
-  
-  setUserProfile: (userProfile) => {
-    localStorage.setItem(CONFIG.STORAGE_KEYS.USER_PROFILE, JSON.stringify(userProfile));
+
+  setUserProfile: (userProfile: UserProfile) => {
+    localStorage.setItem(STORAGE_KEY_USER_PROFILE, JSON.stringify(userProfile));
     set({ userProfile });
   },
-  
-  setCountdownSeconds: (countdownSeconds) => set({ countdownSeconds }),
-  
+
+  setCountdownSeconds: (countdownSeconds: number) => set({ countdownSeconds }),
+
   startNewIncident: () => {
     const incidentId = `INCIDENT-${Date.now()}`;
     set({
       currentIncidentId: incidentId,
-      countdownSeconds: CONFIG.COUNTDOWN_DURATION_SEC,
+      countdownSeconds: COUNTDOWN_DURATION_SEC,
       activeAnalysisResult: null,
-      postIncidentFeed: []
+      confidenceScore: null,
+      postIncidentFeed: [],
     });
     get().addLog('ALERT', `🚨 NEW INCIDENT CAPTURED: ${incidentId}`);
     return incidentId;
   },
-  
+
   endIncident: () => {
-    get().addLog('INFO', `Incident resolution concluded.`);
+    get().addLog('INFO', 'Incident resolved. System returning to monitoring.');
     set({
       currentIncidentId: null,
       activeAnalysisResult: null,
-      countdownSeconds: CONFIG.COUNTDOWN_DURATION_SEC,
+      confidenceScore: null,
+      countdownSeconds: COUNTDOWN_DURATION_SEC,
       isCameraActiveSimulated: false,
       showSmsSimulated: false,
       smsMessageSimulated: '',
-      postIncidentFeed: []
+      postIncidentFeed: [],
     });
   },
 
-  setActiveAnalysisResult: (activeAnalysisResult) => set({ activeAnalysisResult }),
+  setActiveAnalysisResult: (activeAnalysisResult: GeminiResponse | null) =>
+    set({ activeAnalysisResult }),
 
-  // Simulation actions
-  setCameraActiveSimulated: (isCameraActiveSimulated) => set({ isCameraActiveSimulated }),
-  setShowSmsSimulated: (showSmsSimulated) => set({ showSmsSimulated }),
-  setSmsMessageSimulated: (smsMessageSimulated) => set({ smsMessageSimulated }),
-  addPostIncidentFeed: (feedItem) => set((state) => ({ postIncidentFeed: [feedItem, ...state.postIncidentFeed] })),
-  clearPostIncidentFeed: () => set({ postIncidentFeed: [] })
+  setConfidenceScore: (confidenceScore: ConfidenceScore | null) => set({ confidenceScore }),
+
+  // Simulation-specific
+  setCameraActiveSimulated: (isCameraActiveSimulated: boolean) =>
+    set({ isCameraActiveSimulated }),
+  setShowSmsSimulated: (showSmsSimulated: boolean) => set({ showSmsSimulated }),
+  setSmsMessageSimulated: (smsMessageSimulated: string) => set({ smsMessageSimulated }),
+  addPostIncidentFeed: (feedItem: string) =>
+    set(state => ({ postIncidentFeed: [feedItem, ...state.postIncidentFeed] })),
+  clearPostIncidentFeed: () => set({ postIncidentFeed: [] }),
 }));
